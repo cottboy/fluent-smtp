@@ -180,34 +180,61 @@ class LoggerController extends Controller
         $this->verify();
         $logIds = $request->get('log_ids', []);
 
-        $failedCount = 0;
-        $this->app->addAction('wp_mail_failed', function($response) use (&$failedCount) {
-            $failedCount++;
-        });
+        if (!is_array($logIds) || !$logIds || count($logIds) > 20) {
+            return $this->sendError([
+                'message' => __('Please select between 1 and 20 emails.', 'fluent-smtp')
+            ]);
+        }
 
-        $failedInitiated = 0;
+        foreach ($logIds as $logId) {
+            if ((!is_int($logId) && !is_string($logId)) || !ctype_digit((string)$logId) || (int)$logId < 1) {
+                return $this->sendError([
+                    'message' => __('Invalid email log selection.', 'fluent-smtp')
+                ]);
+            }
+        }
+
+        $logIds = array_unique(array_map('intval', $logIds));
+        $errors = [];
         $successCount = 0;
         foreach ($logIds as $logId) {
             try {
                 $email = $logger->resendEmailFromLog($logId, 'check_realtime');
+                if (!$email) {
+                    throw new \Exception(__('The email log could not be resent.', 'fluent-smtp'));
+                }
                 $successCount++;
             } catch (\Exception $exception) {
-                $failedInitiated++;
+                $errors[] = sprintf(
+                    /* translators: 1: email log ID, 2: sending error */
+                    __('Email #%1$d: %2$s', 'fluent-smtp'),
+                    $logId,
+                    sanitize_text_field($exception->getMessage())
+                );
             }
         }
-        $message = __('The selected emails have been resent.', 'fluent-smtp');
 
-        if ($failedCount) {
-            $message .= sprintf(__(' %d of them failed to send.', 'fluent-smtp'), $failedCount);
-        }
+        $failedCount = count($errors);
+        $message = $failedCount
+            ? sprintf(
+                /* translators: 1: successful email count, 2: failed email count */
+                __('Resent: %1$d. Failed: %2$d.', 'fluent-smtp'),
+                $successCount,
+                $failedCount
+            ) . ' ' . implode(' ', $errors)
+            : sprintf(
+                /* translators: %d: successful email count */
+                __('Successfully resent %d email(s).', 'fluent-smtp'),
+                $successCount
+            );
 
-        if ($failedInitiated) {
-            $message .= sprintf(__(' %d could not be prepared for sending.', 'fluent-smtp'), $failedInitiated);
-        }
+        $data = [
+            'message'       => $message,
+            'success_count' => $successCount,
+            'failed_count'  => $failedCount,
+            'errors'        => $errors
+        ];
 
-        return $this->sendSuccess([
-            'message' => $message
-        ]);
-
+        return $successCount ? $this->sendSuccess($data) : $this->sendError($data);
     }
 }

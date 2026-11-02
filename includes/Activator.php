@@ -12,6 +12,9 @@ class Activator
         if (!wp_next_scheduled($emailReportHookName)) {
             wp_schedule_event(time(), 'daily', $emailReportHookName);
         }
+
+        // Re-arm the queue for sites that had it enabled before deactivation.
+        \FluentMail\App\Services\Mailer\EmailQueue::syncSchedule();
         
         add_filter('pre_update_option_active_plugins', function ($plugins) {
             $index = array_search('fluent-smtp/fluent-smtp.php', $plugins);

@@ -22,11 +22,40 @@ class FluentPHPMailer
 
     public function send()
     {
+        /*
+         * Consumed once, at the start of the replay, so a wp_mail() call made
+         * by a hook during the send cannot write that other email into the
+         * queued row.
+         */
+        $queueRowId = EmailQueue::isSending() ? EmailQueue::takeReplayRowId() : 0;
+
         if ($driver = fluentMailGetProvider($this->phpMailer->From)) {
             if ($forceFromEmail = $driver->getSetting('force_from_email_id')) {
                 $this->phpMailer->From = $forceFromEmail;
             }
-            return $driver->setPhpMailer($this->phpMailer)->send();
+
+            $driver->setPhpMailer($this->phpMailer);
+
+            if ($queueRowId && $driver->writesQueueRow()) {
+                /*
+                 * The provider cache is shared by every send from this address.
+                 * The clone keeps the row id on the one replay that owns it.
+                 */
+                $driver = clone $driver;
+                $driver->setQueueRowId($queueRowId);
+            }
+
+            /*
+             * A queued email has not been sent, so the caller gets true as soon
+             * as the log row is written. If the copy or the insert fails,
+             * queueForAsync() returns false and this request sends normally
+             * instead of dropping the message.
+             */
+            if ($driver->shouldQueueForAsync() && $driver->queueForAsync()) {
+                return true;
+            }
+
+            return $driver->send();
         }
 
         // No connection routes this address, so PHPMailer sends it however the

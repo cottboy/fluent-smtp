@@ -43,7 +43,7 @@
 <script>
 export default {
     name: 'EmailbodyContainer',
-    props: ['content', 'plainText'],
+    props: ['content', 'plainText', 'inlineImages'],
     data() {
         return {
             // ...
@@ -83,10 +83,50 @@ export default {
                     if (this.plainText) {
                         doc.body.textContent = body;
                     } else {
-                        doc.body.innerHTML = body;
+                        doc.body.innerHTML = this.resolveInlineImages(body, doc);
                     }
                 }
             });
+        },
+        /*
+         * The stored body refers to an inline picture by cid:, not by a URL.
+         * The server sends those images as data URIs keyed by cid, so swap
+         * them in here - after DOMPurify has run on the body - without
+         * changing what is stored for a resend.
+         */
+        resolveInlineImages(html, doc) {
+            const images = this.inlineImages;
+
+            if (!images || typeof images !== 'object' || !Object.keys(images).length) {
+                return html;
+            }
+
+            const holder = doc.createElement('div');
+            holder.innerHTML = html;
+
+            holder.querySelectorAll('img[src]').forEach((img) => {
+                const src = (img.getAttribute('src') || '').trim();
+
+                if (!/^cid:/i.test(src)) {
+                    return;
+                }
+
+                let cid = src.slice(4).replace(/^<|>$/g, '');
+
+                if (!Object.prototype.hasOwnProperty.call(images, cid)) {
+                    try {
+                        cid = decodeURIComponent(cid);
+                    } catch (e) {
+                        return;
+                    }
+                }
+
+                if (Object.prototype.hasOwnProperty.call(images, cid)) {
+                    img.setAttribute('src', images[cid]);
+                }
+            });
+
+            return holder.innerHTML;
         },
         fullScreen() {
             const d = document;
@@ -116,6 +156,12 @@ export default {
         },
         plainText() {
             this.setBody(this.content);
+        },
+        inlineImages: {
+            deep: true,
+            handler() {
+                this.setBody(this.content);
+            }
         }
     }
 };

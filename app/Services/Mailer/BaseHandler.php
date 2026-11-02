@@ -5,6 +5,7 @@ namespace FluentMail\App\Services\Mailer;
 use Exception;
 use InvalidArgumentException;
 use FluentMail\App\Models\Logger;
+use FluentMail\App\Hooks\Handlers\BulkSendSessionHandler;
 use FluentMail\Includes\Support\Arr;
 use FluentMail\Includes\Core\Application;
 use FluentMail\App\Services\Mailer\Manager;
@@ -29,6 +30,17 @@ class BaseHandler
     protected $response = null;
 
     protected $existing_row_id = null;
+
+    /**
+     * Log row a queue replay owns.
+     *
+     * Distinct from $existing_row_id, which marks the fallback attempt of a
+     * synchronous send and merges its response into that row. A queue replay
+     * is a primary attempt that happens to already have a row.
+     *
+     * @var int|null
+     */
+    protected $queue_row_id = null;
 
     protected $sendStartedAt = null;
 
@@ -95,6 +107,164 @@ class BaseHandler
         $this->settings = $settings;
 
         return $this;
+    }
+
+    /**
+     * Whether this send should be written to the queue instead of sent now.
+     *
+     * Test emails, manual resends, the queue's own replays, FluentCRM bulk
+     * sessions and simulated sends all stay synchronous. FluentCRM already
+     * sends in the background and reuses one SMTP connection across a run;
+     * queueing each message would lose that reuse and slow a campaign down.
+     *
+     * @return bool
+     */
+    public function shouldQueueForAsync()
+    {
+        if (defined('FLUENTMAIL_EMAIL_TESTING') || defined('FLUENTMAIL_TEST_EMAIL')) {
+            return false;
+        }
+
+        if (defined('FLUENTMAIL_LOG_OFF')) {
+            return false;
+        }
+
+        if (EmailQueue::isSending()) {
+            return false;
+        }
+
+        if (BulkSendSessionHandler::isActive()) {
+            return false;
+        }
+
+        $misc = $this->manager->getConfig('misc', []);
+
+        if (isset($misc['simulate_emails']) && $misc['simulate_emails'] === 'yes') {
+            return false;
+        }
+
+        if (defined('FLUENTMAIL_SIMULATE_EMAILS') && FLUENTMAIL_SIMULATE_EMAILS) {
+            return false;
+        }
+
+        if (!isset($misc['log_emails']) || $misc['log_emails'] !== 'yes') {
+            return false;
+        }
+
+        return isset($misc['async_email_sending']) && $misc['async_email_sending'] === 'yes';
+    }
+
+    /**
+     * Persist this email as a queued log row and let cron deliver it later.
+     *
+     * Attachments are copied before the request ends because uploads that
+     * arrived with this request are normally deleted with it. A copy failure
+     * returns false, and the caller sends synchronously so the email is not
+     * lost.
+     *
+     * @return bool
+     */
+    public function queueForAsync()
+    {
+        $stored = false;
+        $logId = 0;
+
+        try {
+            $rawAttachments = $this->phpMailer ? $this->phpMailer->getAttachments() : [];
+            $attachmentStore = new AttachmentStore();
+            $stored = $attachmentStore->storeForQueue((array)$rawAttachments);
+
+            if ($stored === false) {
+                return false;
+            }
+
+            if (!$this->preSend()) {
+                $attachmentStore->deleteForAttachmentList($stored['attachments']);
+                return false;
+            }
+
+            EmailQueue::ensureSchema();
+
+            $extra = (array)$this->getExtraParams();
+            $extra['queued_at'] = time();
+
+            /*
+             * A fallback attempt rewrites the row's sender to the fallback
+             * connection. Keeping the address this email actually resolved
+             * to lets every retry start from the primary connection again.
+             * The PHPMailer address, not the connection's configured sender,
+             * because one connection can serve several sender addresses.
+             */
+            if (!empty($this->phpMailer->From)) {
+                $extra['original_sender_email'] = $this->phpMailer->From;
+            }
+
+            if (!empty($this->phpMailer->FromName)) {
+                $extra['original_sender_name'] = $this->phpMailer->FromName;
+            }
+
+            if (!empty($stored['temporary'])) {
+                $extra['attachments_temporary'] = true;
+            }
+
+            $customHeaders = isset($this->attributes['custom_headers']) && is_array($this->attributes['custom_headers'])
+                ? $this->attributes['custom_headers']
+                : [];
+
+            if ($customHeaders) {
+                $extra['custom_headers'] = $customHeaders;
+            }
+
+            $headers = $this->getParam('headers');
+
+            if (!is_array($headers)) {
+                $headers = [];
+            }
+
+            /*
+             * There is no column for the plain-text alternative and `extra` is
+             * TEXT, so the text part rides in the headers blob (LONGTEXT).
+             * LoggedEmailReplayer strips it back out before wp_mail() sees it.
+             */
+            if (!empty($this->attributes['alt_body'])) {
+                $headers['__fluentmail_alt_body'] = (string)$this->attributes['alt_body'];
+            }
+
+            $data = [
+                'to'           => $this->serialize($this->attributes['to']),
+                'from'         => $this->attributes['from'],
+                'subject'      => sanitize_text_field($this->attributes['subject']),
+                'body'         => $this->attributes['message'],
+                'attachments'  => $this->serialize($stored['attachments']),
+                'status'       => Logger::STATUS_PENDING,
+                'response'     => null,
+                'headers'      => $this->serialize($headers, ['__fluentmail_alt_body']),
+                'extra'        => $this->serialize($extra, ['custom_headers']),
+                'auto_retries' => 0,
+                'created_at'   => current_time('mysql'),
+                'updated_at'   => current_time('mysql')
+            ];
+
+            $logId = (new Logger())->add($data);
+
+            if (!is_int($logId) || $logId <= 0) {
+                $logId = 0;
+                $attachmentStore->deleteForAttachmentList($stored['attachments']);
+                return false;
+            }
+
+            EmailQueue::schedule();
+
+            return true;
+        } catch (\Throwable $e) {
+            if ($stored !== false && !$logId) {
+                (new AttachmentStore())->deleteForAttachmentList($stored['attachments']);
+            }
+
+            fluentMailDebugLog('Failed to queue email - ' . $e->getMessage());
+
+            return false;
+        }
     }
 
     protected function preSend()
@@ -661,36 +831,118 @@ class BaseHandler
      */
     protected function writeLog($response, $status)
     {
+        $attachments = isset($this->attributes['attachments']) && is_array($this->attributes['attachments'])
+            ? $this->attributes['attachments']
+            : [];
+
+        $rowId = $this->existing_row_id ?: $this->queue_row_id;
+        $existingRow = $rowId ? (new Logger())->find($rowId) : [];
+
+        if ($attachments) {
+            if ($rowId) {
+                /*
+                 * A fallback reuses the row written by the first attempt, and a
+                 * queued replay reuses the copies made when the email entered
+                 * the queue. Copying again would orphan the first set and make
+                 * the row point at a second one.
+                 */
+                $existingAttachments = isset($existingRow['attachments']) ? $existingRow['attachments'] : '';
+
+                if (is_serialized($existingAttachments)) {
+                    $decoded = unserialize(trim($existingAttachments), ['allowed_classes' => false]);
+
+                    if (is_array($decoded) && $decoded) {
+                        $attachments = $decoded;
+                    }
+                }
+            } else {
+                /*
+                 * Runs after the provider has answered, so a copy failure must
+                 * leave the log pointing at the original files rather than fail a
+                 * send that already happened.
+                 */
+                $attachments = (new AttachmentStore())->storeForLog($attachments);
+            }
+        }
+
+        $extra = (array)$this->getExtraParams();
+
+        if ($rowId && isset($existingRow['extra']) && is_array($existingRow['extra'])) {
+            /*
+             * Both callers write a row that already holds state of its own:
+             * the fallback's own record, or the queue marker, retry anchor and
+             * attachment flags. Provider and timing values are refreshed;
+             * everything else survives the write.
+             */
+            $extra = array_merge($existingRow['extra'], $extra);
+        }
+
+        $headers = $this->getParam('headers');
+
+        if (!is_array($headers)) {
+            $headers = [];
+        }
+
+        if ($rowId && !empty($existingRow['headers']) && is_string($existingRow['headers']) && is_serialized($existingRow['headers'])) {
+            $storedHeaders = unserialize(trim($existingRow['headers']), ['allowed_classes' => false]);
+
+            if (is_array($storedHeaders) && isset($storedHeaders['__fluentmail_alt_body'])) {
+                $headers['__fluentmail_alt_body'] = $storedHeaders['__fluentmail_alt_body'];
+            }
+        }
+
         $data = [
             'to' => $this->serialize($this->attributes['to']),
             'from' => $this->attributes['from'],
             'subject' => sanitize_text_field($this->attributes['subject']),
             'body' => $this->attributes['message'],
-            'attachments' => $this->serialize($this->attributes['attachments']),
+            'attachments' => $this->serialize($attachments),
             'status'   => $status ? 'sent' : 'failed',
             'response' => $this->serialize($response),
-            'headers'  => $this->serialize($this->getParam('headers')),
-            'extra'    => $this->serialize($this->getExtraParams())
+            'headers'  => $this->serialize($headers, ['__fluentmail_alt_body']),
+            'extra'    => $this->serialize($extra, ['custom_headers'])
         ];
 
         if($this->existing_row_id) {
-            $row = (new Logger())->find($this->existing_row_id);
-            if($row) {
-                $row['response'] = (array) $row['response'];
+            if($existingRow) {
+                $existingRow['response'] = (array) $existingRow['response'];
                 if($status) {
-                    $row['response']['fallback'] = __('Sent using fallback connection ', 'fluent-smtp') . $this->attributes['from'];
-                    $row['response']['fallback_response'] = $response;
+                    $existingRow['response']['fallback'] = __('Sent using fallback connection ', 'fluent-smtp') . $this->attributes['from'];
+                    $existingRow['response']['fallback_response'] = $response;
                 } else {
-                    $row['response']['fallback'] = __('Tried to send using fallback but failed. ', 'fluent-smtp') . $this->attributes['from'];
-                    $row['response']['fallback_response'] = $response;
+                    $existingRow['response']['fallback'] = __('Tried to send using fallback but failed. ', 'fluent-smtp') . $this->attributes['from'];
+                    $existingRow['response']['fallback_response'] = $response;
                 }
 
-                $data['response'] = $this->serialize( $row['response']);
-                $data['retries'] = $row['retries'] + 1;
-                (new Logger())->updateLog($data, ['id' => $row['id']]);
+                $data['response'] = $this->serialize( $existingRow['response']);
+                $data['retries'] = $existingRow['retries'] + 1;
+                $updated = (new Logger())->updateLog($data, ['id' => $existingRow['id']]);
+
+                if ($updated !== false && EmailQueue::isActiveReplayRow($existingRow['id'])) {
+                    EmailQueue::markReplayRowWritten();
+                }
 
                 if(!$status) {
-                    do_action('fluentmail_email_sending_failed_no_fallback', $row['id'], $this, $data);
+                    do_action('fluentmail_email_sending_failed_no_fallback', $existingRow['id'], $this, $data);
+                }
+            }
+        } elseif ($this->queue_row_id) {
+            if ($existingRow) {
+                $data['updated_at'] = current_time('mysql');
+
+                $updated = (new Logger())->updateLog($data, ['id' => $this->queue_row_id]);
+
+                if ($updated !== false) {
+                    EmailQueue::markReplayRowWritten();
+                }
+
+                if (!$status) {
+                    /*
+                     * The same filter a synchronous send fires, so the fallback
+                     * connection and the failure alerts handle a queued email
+                     * exactly as they handle any other one.
+                     */
+                    $status = apply_filters('fluentmail_email_sending_failed', $status, $this->queue_row_id, $this, $data);
                 }
             }
         } else {
@@ -709,6 +961,22 @@ class BaseHandler
         if($this->existing_row_id) {
             return true;
         }
+
+        /*
+         * A queue replay owns a row already. Letting the normal send path
+         * write it is what brings the fallback connection and the failure
+         * alerts to queued email; the row is updated, not duplicated.
+         */
+        if ($this->queue_row_id) {
+            return true;
+        }
+
+        // A send the queue did not route (no provider matched the sender) has
+        // no row to update, so writing one here would duplicate its log entry.
+        if (EmailQueue::isSending()) {
+            return false;
+        }
+
         if (defined('FLUENTMAIL_LOG_OFF') && FLUENTMAIL_LOG_OFF) {
             return false;
         }
@@ -723,14 +991,31 @@ class BaseHandler
         return apply_filters('fluentmail_will_log_email', $isLogOn, $miscSettings, $this);
     }
 
-    protected function serialize(array $data)
+    /**
+     * @param array $data
+     * @param array $keepRaw Top-level keys stored byte-for-byte.
+     * @return string
+     */
+    protected function serialize(array $data, array $keepRaw = [])
     {
-        return serialize($this->recursiveSanitize($data));
+        return serialize($this->recursiveSanitize($data, $keepRaw));
     }
 
-    protected function recursiveSanitize(array $data)
+    protected function recursiveSanitize(array $data, array $keepRaw = [])
     {
         foreach ($data as $key => $item) {
+
+            if (in_array($key, $keepRaw, true)) {
+                /*
+                 * Replay payloads keep their exact bytes. The generic text
+                 * sanitizer strips angle brackets and collapses line breaks,
+                 * both of which are meaningful in a custom header value and in
+                 * the plain-text alternative. Custom headers are validated
+                 * again when they are replayed; the text part is email content,
+                 * stored raw like `body` is.
+                 */
+                continue;
+            }
 
             if (is_array($item)) {
                 // Reassign the sanitized array back; without this, nested values
@@ -792,6 +1077,29 @@ class BaseHandler
     public function setRowId($id)
     {
         $this->existing_row_id = $id;
+    }
+
+    /**
+     * @param int $id
+     * @return void
+     */
+    public function setQueueRowId($id)
+    {
+        $this->queue_row_id = (int)$id;
+    }
+
+    /**
+     * Whether a queue replay may hand this handler the row to update.
+     *
+     * True for every provider that logs through processResponse(). The
+     * Simulator writes its own log and returns without reaching writeLog(),
+     * so the queue records that outcome itself.
+     *
+     * @return bool
+     */
+    public function writesQueueRow()
+    {
+        return true;
     }
 
     public function addNewSenderEmail($connection, $email)

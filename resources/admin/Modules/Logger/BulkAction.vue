@@ -20,7 +20,7 @@
                 :label="$t('Delete Selected')"
                 v-if="selected.length"
             />
-            <el-option v-if="is_failed_selected" value="resend_selected" :label="$t('Resend Selected')" />
+            <el-option v-if="canResend" value="resend_selected" :label="$t('Resend Selected')" />
         </el-select>
 
         <el-button
@@ -35,17 +35,12 @@
 <script>
     export default {
         name: 'BulkAction',
-        props: ['selected'],
+        props: ['selected', 'canResend'],
         data() {
             return {
                 action: '',
                 resending: false
             };
-        },
-        computed: {
-            is_failed_selected() {
-                return !!this.selected.length;
-            }
         },
         methods: {
             applyBulkAction() {

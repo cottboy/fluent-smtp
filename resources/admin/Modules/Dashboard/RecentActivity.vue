@@ -43,10 +43,11 @@
 
             <ul v-else class="fsm_activity_list">
                 <li v-for="log in logs" :key="log.id" class="fsm_activity_item"
-                    :class="log.status === 'failed' ? 'is_failed' : 'is_sent'">
+                    :class="log.status === 'failed' ? 'is_failed' : (log.status === 'pending' ? 'is_pending' : 'is_sent')">
                     <span class="fsm_activity_icon">
                         <el-icon>
                             <FsmIconWarning v-if="log.status === 'failed'"/>
+                            <FsmIconTimer v-else-if="log.status === 'pending'"/>
                             <FsmIconSPromotion v-else/>
                         </el-icon>
                     </span>

@@ -54,4 +54,14 @@ class Handler extends BaseHandler
         $this->settings = $settings;
         return $this;
     }
+
+    /**
+     * The simulator writes its own log row, so the queue records its outcome.
+     *
+     * @return bool
+     */
+    public function writesQueueRow()
+    {
+        return false;
+    }
 }

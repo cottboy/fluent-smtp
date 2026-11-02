@@ -13,6 +13,7 @@
             <el-radio-button value="">{{ $t('All') }}</el-radio-button>
             <el-radio-button value="sent">{{ $t('Sent') }}</el-radio-button>
             <el-radio-button value="failed">{{ $t('Failed') }}</el-radio-button>
+            <el-radio-button value="pending">{{ $t('Queued') }}</el-radio-button>
         </el-radio-group>
 
         <div class="fsm_log_filter_tools">

@@ -165,6 +165,8 @@ class AdminMenuHandler
             wp_schedule_event(time(), 'daily', $dailyTaskHookName);
         }
 
+        \FluentMail\App\Services\Mailer\EmailQueue::syncSchedule();
+
         $this->app->view->render('admin.menu');
     }
 
@@ -345,7 +347,8 @@ class AdminMenuHandler
             'plugin_url'             => 'https://fluentsmtp.com/?utm_source=wp&utm_medium=install&utm_campaign=dashboard',
             'trans'                  => $this->getTrans(),
             'recommended'            => $recommendedSettings,
-            'is_disabled_defined'    => defined('FLUENTMAIL_SIMULATE_EMAILS') && FLUENTMAIL_SIMULATE_EMAILS
+            'is_disabled_defined'    => defined('FLUENTMAIL_SIMULATE_EMAILS') && FLUENTMAIL_SIMULATE_EMAILS,
+            'wp_cron_disabled'       => defined('DISABLE_WP_CRON') && DISABLE_WP_CRON
         ]);
 
         do_action('fluent_mail_loading_app');

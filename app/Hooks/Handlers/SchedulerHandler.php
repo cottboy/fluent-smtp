@@ -6,6 +6,7 @@ use FluentMail\App\Models\Logger;
 use FluentMail\App\Models\Settings;
 use FluentMail\App\Services\ConnectionHealth;
 use FluentMail\App\Services\NotificationHelper;
+use FluentMail\App\Services\Mailer\EmailQueue;
 use FluentMail\App\Services\Notification\Manager as NotificationManager;
 use FluentMail\Includes\Support\Arr;
 
@@ -18,12 +19,23 @@ class SchedulerHandler
         add_action($this->dailyActionName, array($this, 'handleScheduledJobs'));
         add_filter('fluentmail_email_sending_failed', array($this, 'maybeHandleFallbackConnection'), 10, 4);
 
+        add_action(EmailQueue::ACTION, array($this, 'processEmailQueue'));
+        add_filter('cron_schedules', array(EmailQueue::class, 'addCronSchedule'));
+
         add_action('fluentsmtp_renew_gmail_token', array($this, 'renewGmailToken'));
         add_action('fluentsmtp_renew_outlook_token', array($this, 'renewOutlookToken'));
 
         add_action('fluentmail_email_sending_failed_no_fallback', array($this, 'maybeSendNotification'), 10, 3);
 
         add_action('fluentmail_connection_health_failed', array($this, 'notifyUnhealthyConnections'));
+    }
+
+    /**
+     * @return void
+     */
+    public function processEmailQueue()
+    {
+        (new EmailQueue())->process();
     }
 
     public function handleScheduledJobs()
@@ -398,6 +410,16 @@ class SchedulerHandler
 
     public function maybeSendNotification($rowId, $handler, $logData = [])
     {
+        /*
+         * A queued email is announced once, when its first attempt fails. The
+         * queue marks the row after that, so every later automatic retry is
+         * recognisable here and stays silent - otherwise one unreachable
+         * mailbox would page the site owner four times.
+         */
+        if ($this->isQueuedRetry($rowId)) {
+            return false;
+        }
+
         $lastNotificationSent = get_option('_fsmtp_last_notification_sent');
         if ($lastNotificationSent && (time() - $lastNotificationSent) < 60) {
             return false;
@@ -450,6 +472,26 @@ class SchedulerHandler
         }
 
         return true;
+    }
+
+    /**
+     * Whether this failure belongs to the automatic retry of a queued email.
+     *
+     * The queue stamps `retry_started_at` into the existing `extra` column
+     * when the first attempt fails, and only a queued email carries it.
+     *
+     * @param int $rowId
+     * @return bool
+     */
+    protected function isQueuedRetry($rowId)
+    {
+        $row = $rowId ? (new Logger())->find($rowId) : [];
+
+        if (!$row || empty($row['extra']) || !is_array($row['extra'])) {
+            return false;
+        }
+
+        return !empty($row['extra']['retry_started_at']);
     }
 
     private function saveNewGmailTokens($existingData, $tokens)

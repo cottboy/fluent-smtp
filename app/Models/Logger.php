@@ -5,12 +5,34 @@ namespace FluentMail\App\Models;
 use Exception;
 use InvalidArgumentException;
 use FluentMail\Includes\Support\Arr;
+use FluentMail\App\Services\Mailer\AttachmentStore;
 
 class Logger extends Model
 {
     const STATUS_PENDING = 'pending';
     const STATUS_FAILED  = 'failed';
     const STATUS_SENT    = 'sent';
+
+    /*
+     * `auto_retries` is the automatic retry stage, not just a count:
+     * 0 means the row is not waiting on a retry, 1 to 3 mean the retry due
+     * after 2, 20 or 60 minutes, and 4 means no further automatic attempt.
+     * Keeping the stage in a numeric column lets the queue find waiting rows
+     * through an index; the first-failure time still lives in `extra` for
+     * timing and alert suppression.
+     */
+    const AUTO_RETRY_MAX = 3;
+    const AUTO_RETRY_FINAL = 4;
+
+    /*
+     * Inline images are sent to the log viewer as data URIs. One image may
+     * use the whole byte budget; the total and count caps only stop a single
+     * log detail from becoming an unbounded download. Anything over a cap is
+     * left out and the body keeps its broken image reference, as it did
+     * before this existed.
+     */
+    const MAX_INLINE_IMAGE_TOTAL = 10485760;
+    const MAX_INLINE_IMAGES      = 30;
 
     protected $fillables = [
         'to',
@@ -257,6 +279,14 @@ class Logger extends Model
              * HTML has to escape it at that point, as digest_email.php does.
              */
             $result[$key]['subject'] = wp_unslash($result[$key]['subject']);
+
+            if (isset($result[$key]['headers']) && is_array($result[$key]['headers'])) {
+                foreach (array_keys($result[$key]['headers']) as $headerName) {
+                    if (strpos((string)$headerName, '__') === 0) {
+                        unset($result[$key]['headers'][$headerName]);
+                    }
+                }
+            }
         }
 
         return $result;
@@ -367,9 +397,18 @@ class Logger extends Model
     public function add($data)
     {
         try {
-            $data = array_merge($data, [
-                'created_at' => current_time('mysql')
-            ]);
+            if (!isset($data['created_at'])) {
+                $data['created_at'] = current_time('mysql');
+            }
+
+            /*
+             * Every new row gets a last-attempt time. The opening send counts as
+             * the first attempt, so the rate limiter can count it later without
+             * walking a separate ledger.
+             */
+            if (!isset($data['updated_at'])) {
+                $data['updated_at'] = $data['created_at'];
+            }
 
             return $this->getDb()->table(FLUENT_MAIL_DB_PREFIX . 'email_logs')
                 ->insert($data);
@@ -381,13 +420,22 @@ class Logger extends Model
 
     public function delete(array $id)
     {
-        if ($id && $id[0] == 'all') {
+        $attachmentStore = new \FluentMail\App\Services\Mailer\AttachmentStore();
+
+        if (isset($id[0]) && $id[0] === 'all') {
             // TRUNCATE doesn't support parameterization
             // Table name is safe - constructed from constants in __construct()
             $result = $this->db->query("TRUNCATE TABLE {$this->table}");
 
-            // The table is empty now, so widening an old VARCHAR `to` column is instant.
             if ($result !== false) {
+                /*
+                 * Only remove the copies once the rows that reference them are
+                 * gone. A failed TRUNCATE must not cost the site its only copy
+                 * of a queued email's attachments.
+                 */
+                $attachmentStore->deleteAll();
+
+                // The table is empty now, so widening an old VARCHAR `to` column is instant.
                 require_once FLUENTMAIL_PLUGIN_PATH . 'database/migrations/EmailLogs.php';
                 \FluentMailMigrations\EmailLogs::maybeWidenToColumn($this->table);
             }
@@ -397,13 +445,22 @@ class Logger extends Model
 
         $ids = array_filter($id, 'intval');
 
-        if ($ids) {
-            return $this->getDb()->table(FLUENT_MAIL_DB_PREFIX . 'email_logs')
-                ->whereIn('id', $ids)
-                ->delete();
+        if (!$ids) {
+            return false;
         }
 
-        return false;
+        $idList = implode(',', array_map('intval', $ids));
+        $rows = $this->db->get_results(
+            "SELECT id, attachments FROM {$this->table} WHERE id IN ({$idList})"
+        );
+
+        foreach ($rows ?: [] as $row) {
+            $attachmentStore->deleteForAttachmentList($row->attachments);
+        }
+
+        return $this->getDb()->table(FLUENT_MAIL_DB_PREFIX . 'email_logs')
+            ->whereIn('id', $ids)
+            ->delete();
     }
 
     public function navigate($data)
@@ -447,6 +504,14 @@ class Logger extends Model
                 $result[$key] = $this->formatResult($keyResult);
             }
 
+            $current = $this->db->get_results(
+                $this->db->prepare("SELECT * FROM {$this->table} WHERE `id` = '%d' LIMIT 1", [$id])
+            );
+
+            $log = $current ? $this->formatResult($current)[0] : null;
+
+            $result['log'] = $log ? $this->attachInlineImages($log) : null;
+
             return $result;
         }
 
@@ -465,19 +530,190 @@ class Logger extends Model
             }
         }
 
+        $log = $result ? $this->formatResult($result[0])[0] : null;
+
         return [
-            'log'  => $result ? $this->formatResult($result[0])[0] : null,
+            'log'  => $log ? $this->attachInlineImages($log) : null,
             'next' => $next,
             'prev' => $prev
         ];
     }
 
+    /**
+     * Add the inline images an HTML body refers to as data URIs.
+     *
+     * The body only stores `cid:` references; the picture itself is an inline
+     * attachment row. Embedding the bytes here lets the admin preview render
+     * the message without exposing the stored copy under a public URL, and
+     * without touching the raw body used when the email is resent.
+     *
+     * @param array $log A row already passed through formatResult().
+     * @return array
+     */
+    protected function attachInlineImages(array $log)
+    {
+        $log['inline_images'] = [];
+
+        $headers = isset($log['headers']) && is_array($log['headers']) ? $log['headers'] : [];
+        $contentType = isset($headers['content-type']) && is_string($headers['content-type'])
+            ? strtolower(trim(strtok($headers['content-type'], ';')))
+            : '';
+
+        if (!in_array($contentType, ['text/html', 'multipart/alternative'], true)) {
+            return $log;
+        }
+
+        $body = isset($log['body']) && is_string($log['body']) ? $log['body'] : '';
+
+        if ($body === '' || stripos($body, 'cid:') === false) {
+            return $log;
+        }
+
+        $attachments = isset($log['attachments']) && is_array($log['attachments']) ? $log['attachments'] : [];
+        $totalBytes = 0;
+
+        foreach ($attachments as $attachment) {
+            if (
+                count($log['inline_images']) >= self::MAX_INLINE_IMAGES
+                || $totalBytes >= self::MAX_INLINE_IMAGE_TOTAL
+            ) {
+                break;
+            }
+
+            if (!is_array($attachment)) {
+                continue;
+            }
+
+            $disposition = isset($attachment[6]) && is_string($attachment[6])
+                ? strtolower($attachment[6])
+                : '';
+
+            if ($disposition !== 'inline') {
+                continue;
+            }
+
+            $cid = isset($attachment[7]) && is_string($attachment[7])
+                ? trim($attachment[7], " \t\n\r\0\x0B<>")
+                : '';
+
+            if (
+                $cid === ''
+                || isset($log['inline_images'][$cid])
+                || !$this->bodyReferencesCid($body, $cid)
+            ) {
+                continue;
+            }
+
+            $image = $this->inlineImageData($attachment, self::MAX_INLINE_IMAGE_TOTAL - $totalBytes);
+
+            if (!$image) {
+                continue;
+            }
+
+            $log['inline_images'][$cid] = 'data:' . $image['mime'] . ';base64,' . base64_encode($image['bytes']);
+            $totalBytes += strlen($image['bytes']);
+        }
+
+        return $log;
+    }
+
+    /**
+     * Whether the HTML body points at this Content-ID.
+     *
+     * @param string $body
+     * @param string $cid
+     * @return bool
+     */
+    protected function bodyReferencesCid($body, $cid)
+    {
+        if (stripos($body, 'cid:' . $cid) !== false) {
+            return true;
+        }
+
+        $encoded = rawurlencode($cid);
+
+        return $encoded !== $cid && stripos($body, 'cid:' . $encoded) !== false;
+    }
+
+    /**
+     * Read one inline image, if it is actually an image and small enough.
+     *
+     * Only files inside wp-content are read. The real path must stay under
+     * that directory, so a path pointing at wp-config.php or through a
+     * symlink out of the tree is refused even if the row asks for it.
+     *
+     * @param array $attachment One row of PHPMailer::getAttachments().
+     * @param int   $maxBytes
+     * @return array{mime: string, bytes: string}|array
+     */
+    protected function inlineImageData(array $attachment, $maxBytes)
+    {
+        $maxBytes = (int)$maxBytes;
+
+        if ($maxBytes <= 0) {
+            return [];
+        }
+
+        if (!empty($attachment[5])) {
+            $bytes = isset($attachment[0]) && is_string($attachment[0]) ? $attachment[0] : '';
+        } else {
+            $path = isset($attachment[0]) && is_string($attachment[0]) ? $attachment[0] : '';
+
+            if ($path === '') {
+                return [];
+            }
+
+            $real = realpath($path);
+
+            if ($real === false || !is_file($real) || !is_readable($real)) {
+                return [];
+            }
+
+            $real = wp_normalize_path($real);
+            $contentDir = trailingslashit(wp_normalize_path(WP_CONTENT_DIR));
+            $inside = DIRECTORY_SEPARATOR === '\\'
+                ? stripos($real, $contentDir) === 0
+                : strpos($real, $contentDir) === 0;
+
+            if (!$inside) {
+                return [];
+            }
+
+            $size = @filesize($real);
+
+            if ($size === false || $size <= 0 || $size > $maxBytes) {
+                return [];
+            }
+
+            $bytes = @file_get_contents($real);
+
+            if ($bytes === false) {
+                return [];
+            }
+        }
+
+        if ($bytes === '' || strlen($bytes) > $maxBytes) {
+            return [];
+        }
+
+        $info = @getimagesizefromstring($bytes);
+
+        if (!$info || empty($info['mime']) || stripos($info['mime'], 'image/') !== 0) {
+            return [];
+        }
+
+        return ['mime' => $info['mime'], 'bytes' => $bytes];
+    }
+
     public function find($id)
     {
-
         $row = $this->getDb()->table(FLUENT_MAIL_DB_PREFIX . 'email_logs')
             ->where('id', $id)
             ->first();
+
+        if (!$row) {
+            return [];
+        }
 
         $row->extra = $this->unserialize($row->extra);
 
@@ -486,146 +722,149 @@ class Logger extends Model
         return (array)$row;
     }
 
+    /**
+     * A log row in the shape the queue and the resend path need.
+     *
+     * find() deliberately leaves the three large columns serialized, while
+     * resendEmailFromLog() used to unpack them itself. Both callers now share
+     * this method so there is one definition of "a sendable log row".
+     *
+     * @param int $id
+     * @return array
+     */
+    public function findForQueue($id)
+    {
+        $row = $this->find($id);
+
+        if (!$row) {
+            return [];
+        }
+
+        return $this->prepareForSend($row);
+    }
+
+    /**
+     * @param array $row Raw find() result.
+     * @return array
+     */
+    protected function prepareForSend(array $row)
+    {
+        foreach (['to', 'headers', 'attachments'] as $key) {
+            $row[$key] = $this->unserialize(isset($row[$key]) ? $row[$key] : '');
+        }
+
+        $row['to'] = $this->normalizeLoggedRecipients($row['to']);
+
+        if (!is_array($row['extra'])) {
+            $row['extra'] = [];
+        }
+
+        return $row;
+    }
+
     public function resendEmailFromLog($id, $type = 'retry', $recipients = [])
     {
-        $email = $this->find($id);
+        $row = $this->find($id);
 
-        $email['to']          = $this->normalizeLoggedRecipients($this->unserialize($email['to']));
-        $email['headers']     = $this->unserialize($email['headers']);
-        $email['attachments'] = $this->unserialize($email['attachments']);
-        $email['extra']       = $this->unserialize($email['extra']);
-
-        // Convert PHPMailer attachment format to wp_mail format
-        $wpMailAttachments = [];
-        if (!empty($email['attachments']) && is_array($email['attachments'])) {
-            foreach ($email['attachments'] as $attachment) {
-                if (is_array($attachment)) {
-                    // PHPMailer format: [path, filename, name, encoding, type, isString, disposition, cid]
-                    if (isset($attachment[0]) && is_string($attachment[0])) {
-                        $filePath = $attachment[0];
-                        if (file_exists($filePath) && is_readable($filePath)) {
-                            $wpMailAttachments[] = $filePath;
-                        }
-                    }
-                } elseif (is_string($attachment)) {
-                    if (file_exists($attachment) && is_readable($attachment)) {
-                        $wpMailAttachments[] = $attachment;
-                    }
-                }
-            }
+        if (!$row) {
+            return false;
         }
 
-        // When custom recipients are provided, drop cc/bcc headers so the email
-        // is only delivered to the requested address(es).
-        $hasCustomRecipients = !empty($recipients) && is_array($recipients);
-        $skipHeaderKeys = $hasCustomRecipients ? ['cc', 'bcc'] : [];
-
-        $headers = [];
-
-        foreach ($email['headers'] as $key => $value) {
-
-            if (in_array(strtolower((string) $key), $skipHeaderKeys, true)) {
-                continue;
-            }
-
-            if($key == 'content-type' && $value == 'multipart/alternative') {
-                $value = 'text/html';
-            }
-
-            if (is_array($value)) {
-                $values = [];
-                $value = array_filter($value);
-                foreach ($value as $v) {
-                    if (is_array($v) && isset($v['email'])) {
-                        $v = $v['email'];
-                    }
-                    $values[] = $v;
-                }
-                if ($values) {
-                    // wp_mail() splits Cc, Bcc and Reply-To on commas only; any
-                    // other separator turns the list into one invalid address,
-                    // which is silently dropped.
-                    $headers[] = "{$key}: " . implode(', ', $values);
-                }
-            } else {
-                if ($value) {
-                    $headers[] = "{$key}: $value";
-                }
-            }
-        }
-
-        $headers = array_merge($headers, [
-            'From: ' . $email['from']
-        ]);
-
-        if ($hasCustomRecipients) {
-            $to = array_values($recipients);
-        } else {
-            $to = [];
-            foreach ((array)$email['to'] as $recipient) {
-                if (!is_array($recipient)) {
-                    if (is_string($recipient) && is_email($recipient)) {
-                        $to[] = $recipient;
-                    }
-                    continue;
-                }
-                if (empty($recipient['email'])) {
-                    continue;
-                }
-                if (!empty($recipient['name'])) {
-                    $to[] = $recipient['name'] . ' <' . $recipient['email'] . '>';
-                } else {
-                    $to[] = $recipient['email'];
-                }
-            }
-        }
+        $email = $this->prepareForSend($row);
 
         try {
             if (!defined('FLUENTMAIL_LOG_OFF')) {
                 define('FLUENTMAIL_LOG_OFF', true);
             }
 
+            $replayer = new \FluentMail\App\Services\Mailer\LoggedEmailReplayer();
+            $recipients = (array)$recipients;
+
             $startedAt = microtime(true);
 
-            $result = wp_mail(
-                $to,
-                $email['subject'],
-                $email['body'],
-                $headers,
-                $wpMailAttachments  // Use the converted attachment format
-            );
+            $replayed = $replayer->send($email, $recipients, '', !(new AttachmentStore())->shouldPreserve());
 
             $durationMs = round((microtime(true) - $startedAt) * 1000, 1);
+
+            if (!$replayed['success']) {
+                // A bulk resend keeps the original log status, while the reason
+                // for this failure is still handed to the page statistics.
+                if ($type === 'check_realtime') {
+                    $this->updateLog([
+                        'status'     => $email['status'] == 'failed' ? 'failed' : 'sent',
+                        'updated_at' => current_time('mysql'),
+                        'retries'    => intval($email['retries']) + 1
+                    ], ['id' => $id]);
+                }
+
+                $error = $replayed['error'];
+
+                throw new \Exception(
+                    is_wp_error($error)
+                        ? $error->get_error_message()
+                        : __('The email could not be sent.', 'fluent-smtp'),
+                    400
+                );
+            }
 
             $updateData = [
                 'status'     => 'sent',
                 'updated_at' => current_time('mysql'),
             ];
 
-            if (!$result && $type == 'check_realtime' && $email['status'] == 'failed') {
-                $updateData['status'] = 'failed';
-            }
-
             if ($type == 'resend') {
                 $updateData['resent_count'] = intval($email['resent_count']) + 1;
                 $updateData['extra'] = maybe_serialize(
-                    $this->appendResendRecord($email['extra'], $to, (bool)$result, $durationMs)
+                    $this->appendResendRecord(
+                        $email['extra'],
+                        $replayer->recipients($email, $recipients),
+                        true,
+                        $durationMs
+                    )
                 );
             } else {
                 $updateData['retries'] = intval($email['retries']) + 1;
             }
 
             if ($this->updateLog($updateData, ['id' => $id])) {
-                $email                = $this->find($id);
-                $email['to']          = $this->normalizeLoggedRecipients($this->unserialize($email['to']));
-                $email['headers']     = $this->unserialize($email['headers']);
-                $email['attachments'] = $this->unserialize($email['attachments']);
-                $email['extra']       = $this->unserialize($email['extra']);
-                return $email;
+                $this->purgeTemporaryAttachmentsAfterSend(
+                    $id,
+                    isset($email['attachments']) ? $email['attachments'] : []
+                );
+
+                return $this->findForQueue($id);
             }
         } catch (\PHPMailer\PHPMailer\Exception $e) {
             throw $e;
         }
+    }
+
+    /**
+     * Remove the copies made for a queued email once a manual send succeeded.
+     *
+     * A manual retry can run while the email is still waiting for its
+     * automatic retry; when it succeeds, the copies are no longer needed. A
+     * final automatic failure removes them itself, so by then this is a no-op.
+     *
+     * @param int   $id
+     * @param mixed $attachments The row's unserialized attachment list.
+     * @return void
+     */
+    protected function purgeTemporaryAttachmentsAfterSend($id, $attachments)
+    {
+        $fresh = $this->find($id);
+        $extra = isset($fresh['extra']) && is_array($fresh['extra']) ? $fresh['extra'] : [];
+
+        if (empty($extra['attachments_temporary'])) {
+            return;
+        }
+
+        (new AttachmentStore())->deleteForAttachmentList((array)$attachments);
+
+        $extra['attachments_temporary'] = false;
+        $extra['attachments_removed'] = true;
+
+        $this->updateLog(['extra' => maybe_serialize($extra)], ['id' => $id]);
     }
 
     /**
@@ -680,6 +919,127 @@ class Logger extends Model
         return $extra;
     }
 
+    /**
+     * Queued rows that have never been attempted.
+     *
+     * Only the columns the scheduler needs are read; the body and attachments
+     * of a queued email can be large and are fetched once it is actually due.
+     *
+     * @param int $limit
+     * @param int $afterId Last row inspected in this queue run.
+     * @return array
+     */
+    public function getNewQueuedEmails($limit = 50, $afterId = 0)
+    {
+        $limit = max(1, (int)$limit);
+
+        $query = $this->db->prepare(
+            "SELECT id, response, auto_retries, updated_at, extra
+             FROM {$this->table}
+             WHERE status = %s
+               AND id > %d
+               AND auto_retries = 0
+               AND (response IS NULL OR response = '')
+             ORDER BY id ASC
+             LIMIT %d",
+            self::STATUS_PENDING,
+            (int)$afterId,
+            $limit
+        );
+
+        return $this->db->get_results($query) ?: [];
+    }
+
+    /**
+     * Rows that have failed and are waiting for an automatic retry.
+     *
+     * The `auto_retries` stage says which retry is due: 1 to 3 are waiting,
+     * while 0 is never queued for a retry and 4 is already final. Filtering
+     * on that numeric stage is what makes the lookup indexable.
+     *
+     * The final due check depends on the first-failure timestamp kept in
+     * `extra`, so the SQL only narrows to rows that are old enough for the
+     * shortest retry delay.
+     *
+     * @param int $limit
+     * @param string $retryBefore Site-local date-time string.
+     * @param int $afterId Last retry inspected in this queue run.
+     * @return array
+     */
+    public function getRetryQueuedEmails($limit = 50, $retryBefore = '', $afterId = 0)
+    {
+        $limit = max(1, (int)$limit);
+
+        if (!$retryBefore) {
+            $retryBefore = gmdate('Y-m-d H:i:s', current_time('timestamp') - 120);
+        }
+
+        $query = $this->db->prepare(
+            "SELECT id, response, auto_retries, updated_at, extra
+             FROM {$this->table}
+             WHERE status = %s
+               AND id > %d
+               AND auto_retries BETWEEN 1 AND %d
+               AND updated_at <= %s
+             ORDER BY id ASC
+             LIMIT %d",
+            self::STATUS_FAILED,
+            (int)$afterId,
+            self::AUTO_RETRY_MAX,
+            $retryBefore,
+            $limit
+        );
+
+        return $this->db->get_results($query) ?: [];
+    }
+
+    /**
+     * Whether any queued email is still unfinished: one that has never been
+     * attempted, or one waiting for an automatic retry.
+     *
+     * @return bool
+     */
+    public function hasPendingEmails()
+    {
+        $query = $this->db->prepare(
+            "SELECT id FROM {$this->table}
+             WHERE status = %s
+                OR (status = %s AND auto_retries BETWEEN 1 AND %d)
+             LIMIT 1",
+            self::STATUS_PENDING,
+            self::STATUS_FAILED,
+            self::AUTO_RETRY_MAX
+        );
+
+        return (bool)$this->db->get_var($query);
+    }
+
+    /**
+     * Count emails attempted in the rate-limit window that starts at $date.
+     *
+     * A row counts once: a failed password, a retry and a later success are
+     * still one email. A queued row that has never been tried does not count.
+     * Rows written before this feature have no updated_at and are outside the
+     * window by design.
+     *
+     * @param string $date Site-local date-time string.
+     * @return int
+     */
+    public function getAttemptCountSince($date)
+    {
+        $query = $this->db->prepare(
+            "SELECT COUNT(*)
+             FROM {$this->table}
+             WHERE status IN (%s, %s)
+               AND updated_at >= %s",
+            self::STATUS_SENT,
+            self::STATUS_FAILED,
+            $date
+        );
+
+        return (int)$this->db->get_var($query);
+    }
+
     public function updateLog($data, $where)
     {
         return $this->db->update($this->table, $data, $where);
@@ -710,15 +1070,46 @@ class Logger extends Model
              * the whole scan - long enough to time out and leave the backlog
              * permanently uncleared, since the next run faces the same pile.
              * Batches let each statement commit and release.
+             *
+             * Rows are selected before they are deleted so their attachment
+             * copies can be removed too. Every status ages out on the same
+             * schedule, including a queued email and one waiting for a retry.
              */
             $batchSize = (int)apply_filters('fluentmail_log_delete_batch_size', 2000);
             $batchSize = max(1, $batchSize);
 
             $deleted = 0;
+            $attachmentStore = new \FluentMail\App\Services\Mailer\AttachmentStore();
 
             do {
+                /*
+                 * Only delete the records this batch selected. Even with a normal
+                 * timeline, the same filters do not guarantee that query and
+                 * delete pick the same rows.
+                 */
+                $select = $this->db->prepare(
+                    "SELECT id, attachments
+                     FROM {$this->table}
+                     WHERE `created_at` < %s
+                     ORDER BY id ASC
+                     LIMIT %d",
+                    $date,
+                    $batchSize
+                );
+
+                $rows = $this->db->get_results($select);
+
+                if (!$rows) {
+                    break;
+                }
+
+                $ids = implode(',', array_map('intval', wp_list_pluck($rows, 'id')));
+
                 $query = $this->db->prepare(
-                    "DELETE FROM {$this->table} WHERE `created_at` < %s LIMIT %d",
+                    "DELETE FROM {$this->table}
+                     WHERE id IN ({$ids})
+                       AND `created_at` < %s
+                     LIMIT %d",
                     $date,
                     $batchSize
                 );
@@ -730,7 +1121,11 @@ class Logger extends Model
                 }
 
                 $deleted += $result;
-            } while ($result >= $batchSize);
+
+                foreach ($rows as $row) {
+                    $attachmentStore->deleteForAttachmentList($row->attachments);
+                }
+            } while (count($rows) >= $batchSize);
 
             return $deleted;
 

@@ -5,6 +5,13 @@ namespace FluentMailMigrations;
 class EmailLogs
 {
     /**
+     * Version of the log-table schema this build expects. Stored in an option
+     * so the queue's per-minute ensureSchema() is an option read, not a set of
+     * SHOW COLUMNS / SHOW INDEX queries on every run.
+     */
+    const SCHEMA_VERSION = '2026-11-02-retry-state';
+
+    /**
      * Migrate the table.
      *
      * @return void
@@ -12,6 +19,10 @@ class EmailLogs
     public static function migrate()
     {
         global $wpdb;
+
+        if (!function_exists('dbDelta')) {
+            require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        }
 
         $charsetCollate = $wpdb->get_charset_collate();
 
@@ -32,17 +43,128 @@ class EmailLogs
                 `response` TEXT NULL,
                 `extra` TEXT NULL,
                 `retries` INT UNSIGNED NULL DEFAULT 0,
+                `auto_retries` TINYINT UNSIGNED NULL DEFAULT 0,
                 `resent_count` INT UNSIGNED NULL DEFAULT 0,
                 `source` VARCHAR(255) NULL,
                 `created_at` TIMESTAMP NULL,
                 `updated_at` TIMESTAMP NULL,
-                INDEX `created_at_status` (`created_at`, `status`)
+                INDEX `created_at_status` (`created_at`, `status`),
+                INDEX `status_updated_at` (`status`, `updated_at`),
+                INDEX `status_auto_retries_updated_at` (`status`, `auto_retries`, `updated_at`)
             ) $charsetCollate;";
 
             dbDelta($sql);
         } else {
+            self::maybeUpgradeColumns($table);
             self::maybeUpgradeIndexes($table);
+            self::maybeUpgradeQueueIndex($table);
         }
+
+        if (
+            self::columnType($table, 'auto_retries') !== null
+            && self::hasIndex($table, 'status_updated_at')
+            && self::hasIndex($table, 'status_auto_retries_updated_at')
+        ) {
+            update_option('fluentmail_db_schema', self::SCHEMA_VERSION, false);
+        }
+    }
+
+    /**
+     * Add the automatic-retry counter to tables created before the email queue.
+     *
+     * Kept separate from maybeUpgradeIndexes() so index-focused callers and
+     * tests only touch indexes. Nullable with a zero default, so the ALTER is
+     * safe for rows written by older releases.
+     *
+     * @param string $table
+     * @return bool
+     */
+    public static function maybeUpgradeColumns($table)
+    {
+        global $wpdb;
+
+        if (!is_string($table) || !preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+            return false;
+        }
+
+        if (self::columnType($table, 'auto_retries') === null) {
+            $wpdb->query("ALTER TABLE `{$table}` ADD COLUMN `auto_retries` TINYINT UNSIGNED NULL DEFAULT 0");
+        }
+
+        return self::columnType($table, 'auto_retries') !== null;
+    }
+
+    /**
+     * Add the queue's status/last-attempt and retry-stage indexes to existing
+     * tables.
+     *
+     * The queue scans pending rows, the rate limiter counts recently attempted
+     * rows, and the retry query narrows on the `auto_retries` stage; all of
+     * them filter on status first and then on updated_at.
+     *
+     * @param string $table
+     * @return void
+     */
+    public static function maybeUpgradeQueueIndex($table)
+    {
+        global $wpdb;
+
+        if (!is_string($table) || !preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+            return;
+        }
+
+        if (!self::hasIndex($table, 'status_updated_at')) {
+            $wpdb->query("ALTER TABLE `{$table}` ADD INDEX `status_updated_at` (`status`, `updated_at`)");
+        }
+
+        if (!self::hasIndex($table, 'status_auto_retries_updated_at')) {
+            $wpdb->query("ALTER TABLE `{$table}` ADD INDEX `status_auto_retries_updated_at` (`status`, `auto_retries`, `updated_at`)");
+        }
+    }
+
+    /**
+     * Bring an existing site's log table up to the current schema.
+     *
+     * Checked while the plugin loads; a site that has already finished the
+     * upgrade returns early.
+     *
+     * @param string|null $table
+     * @return bool
+     */
+    public static function maybeUpgradeSchema($table = null)
+    {
+        global $wpdb;
+
+        if (get_option('fluentmail_db_schema') === self::SCHEMA_VERSION) {
+            return true;
+        }
+
+        $table = $table ?: $wpdb->prefix . FLUENT_MAIL_DB_PREFIX . 'email_logs';
+
+        if (!is_string($table) || !preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+            return false;
+        }
+
+        // Table name is static/hard-coded, so wpdb->prepare() is sufficient
+        if ($wpdb->get_var($wpdb->prepare("SHOW TABLES LIKE %s", $table)) != $table) {
+            self::migrate();
+            return get_option('fluentmail_db_schema') === self::SCHEMA_VERSION;
+        }
+
+        $columnsOk = self::maybeUpgradeColumns($table);
+        if (!$columnsOk) {
+            return false;
+        }
+
+        self::maybeUpgradeIndexes($table);
+        self::maybeUpgradeQueueIndex($table);
+
+        if (self::hasIndex($table, 'status_updated_at') && self::hasIndex($table, 'status_auto_retries_updated_at')) {
+            update_option('fluentmail_db_schema', self::SCHEMA_VERSION, false);
+            return true;
+        }
+
+        return false;
     }
 
     /**
@@ -56,9 +178,8 @@ class EmailLogs
      * `status` would only serve the first group, and barely: a log is
      * overwhelmingly 'sent', so that column narrows almost nothing.
      *
-     * This only runs from migrate(), i.e. on activation and on new-site
-     * creation - never on a normal page load. Reindexing a table that can hold
-     * millions of rows is not free, so it must stay off the request path.
+     * Runs once on activation, on a new site or on a database version upgrade,
+     * and never again after it completes.
      *
      * @param string $table
      * @return void

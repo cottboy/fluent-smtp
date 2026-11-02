@@ -125,7 +125,11 @@
                             <strong style="color:var(--fsm-text-mid)">{{ isPlainText ? $t('Email Body') : $t('Email Body (sanitized)') }}</strong>
                         </template>
                         <hr class="log-border">
-                        <EmailbodyContainer :content="isPlainText ? log.body : sanitize(log.body)" :plain-text="isPlainText"/>
+                        <EmailbodyContainer
+                            :content="isPlainText ? log.body : sanitize(log.body)"
+                            :plain-text="isPlainText"
+                            :inline-images="log.inline_images || {}"
+                        />
                         <hr/>
                     </el-collapse-item>
                     <p><strong>{{ $t('Server Response') }}</strong></p>
@@ -227,7 +231,7 @@ export default {
                 sent: this.$t('Sent'),
                 resent: this.$t('Resent'),
                 failed: this.$t('Failed'),
-                pending: this.$t('Pending')
+                pending: this.$t('Queued')
             }[status] || status;
         },
         navigate(dir) {
@@ -254,6 +258,14 @@ export default {
             this.loading = true;
             this.$get('logs/show', data).then(res => {
                 if (!dir) {
+                    /*
+                     * The list row carries the body but not the inline image
+                     * bytes. The show response is the full detail, so replace
+                     * the row with it before the viewer renders the preview.
+                     */
+                    if (res.data.log) {
+                        this.logViewerProps.log = res.data.log;
+                    }
                     this.next = res.data.next.length;
                     this.prev = res.data.prev.length;
                     return;
@@ -285,10 +297,37 @@ export default {
             this.prev = true;
             this.activeName = 'email_body'
         },
-        getAttachmentName(name) {
-            if (!name || !name[0]) return;
-            name = name[0].replace(/\\/g, '/');
-            return name.split('/').pop();
+        getAttachmentName(attachment) {
+            if (!attachment) return;
+
+            if (typeof attachment === 'string') {
+                return attachment.replace(/\\/g, '/').split('/').pop();
+            }
+
+            /*
+             * Index 2 is the caller supplied name (wp_mail's attachments key),
+             * index 1 the original file's base name. Index 0 is the file path,
+             * which for a kept copy is our random .dat file and must not be
+             * shown. A string attachment keeps its content at index 0, so only
+             * real file rows may fall back to it.
+             */
+            const candidates = [attachment[2], attachment[1]];
+
+            if (!attachment[5]) {
+                candidates.push(attachment[0]);
+            }
+
+            for (const candidate of candidates) {
+                if (typeof candidate !== 'string' || candidate === '') {
+                    continue;
+                }
+
+                const name = candidate.replace(/\\/g, '/').split('/').pop().trim();
+
+                if (name !== '') {
+                    return name;
+                }
+            }
         },
         handleRetry(log, type, recipients = null) {
             this.retrying = true;

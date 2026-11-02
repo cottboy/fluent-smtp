@@ -47,6 +47,8 @@ class ActionsRegistrar
      */
     public function registerHooks()
     {
+        \FluentMail\App\Services\Mailer\EmailQueue::ensureSchema();
+
         $this->registerAdminMenu();
         $this->registerScheduler();
         $this->registerSiteInitialization();

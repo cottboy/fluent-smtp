@@ -52,6 +52,78 @@
             </div>
         </div>
 
+        <div class="fsm_toggle" v-if="settings.misc.log_emails == 'yes'">
+            <div class="fsm_toggle_main">
+                <el-switch v-model="settings.misc.async_email_sending"
+                           :aria-label="$t('Async Email Sending')"
+                           active-value="yes" inactive-value="no"/>
+                <span class="fsm_toggle_title" @click="toggle('async_email_sending')">
+                    {{ $t('Async Email Sending') }}
+                </span>
+            </div>
+            <div class="fsm_toggle_body">
+                <p>{{ $t('Queue emails and send them in the background on the next scheduled run. Test emails and manual resends are sent immediately.') }}</p>
+                <p v-if="settings.misc.async_email_sending == 'yes' && appVars.wp_cron_disabled"
+                   class="fsm_row_warning">
+                    {{ $t('WP-Cron is disabled on this site, so queued emails will not be sent until a real cron job runs wp-cron.php.') }}
+                </p>
+            </div>
+        </div>
+
+        <div class="fsm_toggle" v-if="settings.misc.async_email_sending == 'yes' && settings.misc.log_emails == 'yes'">
+            <div class="fsm_toggle_main">
+                <el-switch v-model="settings.misc.email_rate_limit"
+                           :aria-label="$t('Email Rate Limit')"
+                           active-value="yes" inactive-value="no"/>
+                <span class="fsm_toggle_title" @click="toggle('email_rate_limit')">
+                    {{ $t('Email Rate Limit') }}
+                </span>
+            </div>
+            <div class="fsm_toggle_body">
+                <p>{{ $t('Pause the background queue when any of these windows is full. The queue continues when the window has room again.') }}</p>
+
+                <div class="fsm_rate_grid" v-if="settings.misc.email_rate_limit == 'yes'">
+                    <label v-for="field in visible_rate_fields" :key="field.key" class="fsm_rate_field">
+                        <span>{{ field.label }}</span>
+                        <el-input v-model="settings.misc[field.key]" type="number" min="0" step="1"
+                                  :aria-label="field.label"/>
+                    </label>
+                </div>
+
+                <p class="fsm_rate_hint" v-if="settings.misc.email_rate_limit == 'yes'">
+                    {{ $t('0 means no limit.') }}
+                </p>
+            </div>
+        </div>
+
+        <div class="fsm_toggle" v-if="settings.misc.async_email_sending == 'yes' && settings.misc.log_emails == 'yes'">
+            <div class="fsm_toggle_main">
+                <el-switch v-model="settings.misc.retry_failed_emails"
+                           :aria-label="$t('Retry Failed Emails')"
+                           active-value="yes" inactive-value="no"/>
+                <span class="fsm_toggle_title" @click="toggle('retry_failed_emails')">
+                    {{ $t('Retry Failed Emails') }}
+                </span>
+            </div>
+            <div class="fsm_toggle_body">
+                <p>{{ $t('Retry a background email that failed after 2, 20 and 60 minutes. A failure after the third retry is final. Test emails and manual resends are never retried automatically.') }}</p>
+            </div>
+        </div>
+
+        <div class="fsm_toggle" v-if="settings.misc.log_emails == 'yes'">
+            <div class="fsm_toggle_main">
+                <el-switch v-model="settings.misc.keep_email_attachments"
+                           :aria-label="$t('Keep Attachments in Logs')"
+                           active-value="yes" inactive-value="no"/>
+                <span class="fsm_toggle_title" @click="toggle('keep_email_attachments')">
+                    {{ $t('Keep Attachments in Logs') }}
+                </span>
+            </div>
+            <div class="fsm_toggle_body">
+                <p>{{ $t('Save a copy of each attachment with the log so the email can be resent after the original file is gone. Copies are deleted with the log.') }}</p>
+            </div>
+        </div>
+
         <div class="fsm_toggle">
             <div class="fsm_toggle_main">
                 <el-switch v-model="settings.misc.simulate_emails" :aria-label="$t('Email Simulation')"
@@ -107,7 +179,29 @@
                     180: this.$t('After 6 Months'),
                     365: this.$t('After 1 Year'),
                     730: this.$t('After 2 Years')
-                }
+                },
+                rate_fields: [
+                    {key: 'rate_limit_per_minute', label: this.$t('Per Minute'), seconds: 60},
+                    {key: 'rate_limit_per_hour', label: this.$t('Per Hour'), seconds: 3600},
+                    {key: 'rate_limit_per_day', label: this.$t('Per Day'), seconds: 86400},
+                    {key: 'rate_limit_per_week', label: this.$t('Per Week'), seconds: 604800},
+                    {key: 'rate_limit_per_month', label: this.$t('Per Month'), seconds: 2592000}
+                ]
+            }
+        },
+        computed: {
+            /*
+             * Log rows older than the retention period are deleted, so a window
+             * longer than that period can never count a full window. Hiding it
+             * keeps the form from offering a limit the site cannot measure.
+             * A retention of 0 means logs are never deleted, so every window fits.
+             */
+            logRetentionSeconds() {
+                const days = parseInt(this.settings.misc.log_saved_interval_days, 10);
+                return isFinite(days) && days > 0 ? days * 86400 : Infinity;
+            },
+            visible_rate_fields() {
+                return this.rate_fields.filter(field => field.seconds <= this.logRetentionSeconds);
             }
         },
         methods: {
@@ -131,6 +225,28 @@
              */
             saveMiscSettings() {
                 this.saving = true;
+
+                /*
+                 * The backend enforces the same dependencies. Doing it here keeps
+                 * the switches on screen matching what was actually stored after
+                 * the response, instead of showing async as on until a reload.
+                 */
+                if (this.settings.misc.log_emails != 'yes') {
+                    this.settings.misc.async_email_sending = 'no';
+                }
+
+                if (this.settings.misc.async_email_sending != 'yes') {
+                    this.settings.misc.email_rate_limit = 'no';
+                    this.settings.misc.retry_failed_emails = 'no';
+                }
+
+                this.rate_fields.forEach(field => {
+                    const value = parseInt(this.settings.misc[field.key], 10);
+                    this.settings.misc[field.key] = String(
+                        isFinite(value) && value > 0 ? Math.min(value, 1000000) : 0
+                    );
+                });
+
                 this.$post('misc-settings', {
                     settings: this.settings.misc
                 })
@@ -169,6 +285,27 @@
     .fsm_row_warning {
         font-size: 12px;
         color: var(--fsm-warning-fg) !important;
+        margin-top: 6px !important;
+    }
+
+    .fsm_rate_grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+        margin-top: 10px;
+    }
+
+    .fsm_rate_field {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        font-size: 12px;
+        color: var(--fsm-text-mid);
+    }
+
+    .fsm_rate_hint {
+        font-size: 12px;
+        color: var(--fsm-text-light);
         margin-top: 6px !important;
     }
 

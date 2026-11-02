@@ -121,11 +121,12 @@ class Handler extends BaseHandler
                 }
             }
 
-            if ($attachments = $this->getParam('attachments')) {
-                foreach ($attachments as $attachment) {
-                    $this->phpMailer->addAttachment($attachment[0], $this->getAttachmentName($attachment));
-                }
-            }
+            /*
+             * Attachments are already on the shared PHPMailer: wp_mail() adds
+             * them, and a log replay adds them (with their original name, type
+             * and inline CID) from phpmailer_init. Re-adding them here turned
+             * every embedded image into a second, normal attachment.
+             */
 
             if ($this->getParam('headers.content-type') == 'text/html' || $this->getParam('headers.content-type') == 'multipart/alternative') {
                 $this->phpMailer->isHTML(true);

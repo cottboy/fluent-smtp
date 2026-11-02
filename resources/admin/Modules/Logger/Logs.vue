@@ -12,6 +12,7 @@
                     <LogBulkAction
                         @on-bulk-action="handleBulkAction"
                         :selected="selectedLogs"
+                        :can-resend="canBulkResend"
                         v-if="selectedLogs.length"
                     />
                 </div>
@@ -170,7 +171,7 @@
                     <div class="fsm_pager">
                         <div>
                             <confirm v-if="logs.length" placement="right"
-                                     :message="$t('Delete every logged email? This cannot be undone.')"
+                                     :message="$t('Delete every logged email, including queued emails and their saved attachments? This cannot be undone.')"
                                      @yes="handleDelete(['all'])">
                                 <template #reference>
                                     <el-button size="small" type="info" plain>
@@ -245,6 +246,7 @@ export default {
                 search: ''
             },
             selectedLogs: [],
+            selectedLogRows: [],
             form: null,
             logAlertInfo: null,
             fetchSeq: 0
@@ -252,9 +254,10 @@ export default {
     },
     methods: {
         /*
-         * The status column's chip. `sent` and `failed` are the two the logger writes;
-         * anything else is a state this build does not know about, and a neutral chip
-         * says that better than a colour picked at random would.
+         * The status column's chip. `sent`, `failed` and `pending` (queued) are
+         * the three the logger writes; anything else is a state this build does
+         * not know about, and a neutral chip says that better than a colour
+         * picked at random would.
          */
         statusClass(status) {
             return {
@@ -271,7 +274,7 @@ export default {
             return {
                 sent: this.$t('Sent'),
                 failed: this.$t('Failed'),
-                pending: this.$t('Pending')
+                pending: this.$t('Queued')
             }[status] || status;
         },
         pageChanged() {
@@ -378,6 +381,11 @@ export default {
             } else if (action === 'deleteselected') {
                 return this.handleDelete(this.selectedLogs);
             } else if (action === 'resend_selected') {
+                // A queued email must only go out through the queue; resending it
+                // here would send it immediately and leave the queue row behind.
+                if (!this.canBulkResend) {
+                    return false;
+                }
                 return this.handleResendBulk(this.selectedLogs);
             }
         },
@@ -489,6 +497,7 @@ export default {
         },
         handleSelectionChange(selectedRows) {
             this.selectedLogs = selectedRows.map(i => Number(i.id));
+            this.selectedLogRows = selectedRows;
         },
         saveMisc() {
             this.loading = true;
@@ -535,9 +544,10 @@ export default {
             this.$post('logs/retry-bulk', {
                 log_ids: selectedIds
             }).then(res => {
-                this.$notify.success({
+                this.$notify({
+                    type: res.data.failed_count ? 'warning' : 'success',
                     offset: 19,
-                    title: this.$t('Done'),
+                    title: res.data.failed_count ? this.$t('Error') : this.$t('Done'),
                     message: res.data.message
                 });
                 this.selectedLogs = [];
@@ -549,6 +559,7 @@ export default {
                         title: this.$t('Error'),
                         message: this.$errorMessage(error)
                     });
+                    this.fetch();
                 }).always(() => {
                 this.loading = false;
             });
@@ -557,6 +568,10 @@ export default {
     computed: {
         isLogsOn() {
             return this.form.log_emails === 'yes';
+        },
+        canBulkResend() {
+            return this.selectedLogRows.length > 0
+                && this.selectedLogRows.every(row => row.status !== 'pending');
         },
         logStatusInfo() {
             return this.logAlertInfo.show_status_info;

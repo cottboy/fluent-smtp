@@ -307,6 +307,15 @@ return [
         'disable_fluentcrm_logs'  => 'no',
         'simulate_emails'         => 'no',
         'send_as_text'            => 'no',
+        'async_email_sending'     => 'no',
+        'email_rate_limit'        => 'no',
+        'rate_limit_per_minute'   => '0',
+        'rate_limit_per_hour'     => '0',
+        'rate_limit_per_day'      => '0',
+        'rate_limit_per_week'     => '0',
+        'rate_limit_per_month'    => '0',
+        'retry_failed_emails'     => 'no',
+        'keep_email_attachments'  => 'no',
         'default_connection'      => '',
         'fallback_connection'     => ''
     ]

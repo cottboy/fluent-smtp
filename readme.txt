@@ -56,6 +56,10 @@ FluentSMTP is built for speed, reliability and scale.
 * Connect any email service provider or SMTP server
 * Fallback email connection when the primary one fails
 * Email logging with full headers, body and server response
+* Background email queue with optional async sending
+* Per-minute, hourly, daily, weekly and monthly sending limits
+* Automatic retries for failed background emails
+* Optional attachment copies kept with the log for later resends
 * Resend any logged email to any recipient
 * Detailed email reporting and charts
 * Daily connection health monitoring
@@ -73,6 +77,11 @@ Like any WP mail SMTP plugin, FluentSMTP replaces the WordPress <code>wp_mail()<
 
 == Email Logging and Debugging ==
 FluentSMTP logs every email your WordPress site sends, so you can check at any time what went out, what did not, and what the mail server said about it. Failed emails can be retried, and any logged email can be resent.
+
+== Background Email Queue ==
+Turn on <strong>Async Email Sending</strong> in General Settings to hand each email to a background queue instead of waiting for the mail server during the page request. The queue is driven by WP-Cron and checks for due emails once a minute. On a low-traffic site, configure a real cron job that calls <code>wp-cron.php</code> so queued mail is not delayed.
+
+Sending can be slowed down with per-minute, hourly, daily, weekly and monthly limits; a window set to 0 is unlimited. A limit window longer than the configured log retention is not shown or enforced, because the log rows it would count are deleted before the window ends. Failed background emails can be retried after 2, 20 and 60 minutes. Every queued attempt goes through the normal sending path, so the fallback connection configured in FluentSMTP applies to queued email too, every retry starts from the primary connection, and the email keeps its custom headers and plain-text alternative. A queued email raises its failure alert once, when the first attempt fails; the later automatic retries stay silent. <strong>Keep Attachments in Logs</strong> stores a copy of every attachment with the log, so an email can still be resent after the original file is gone. Test emails and manual resends are sent immediately, never wait in the queue, and are never retried automatically; a manual resend keeps the stored custom headers and plain-text alternative.
 
 == 🎉 Amazon SES (Native API Connection) ==
 The Amazon SES connection sends your WordPress email through Amazon's low-cost, high-deliverability infrastructure, set up in a couple of minutes. It uses Amazon's current SES API and supports every SES region, including the EU Sovereign Cloud.

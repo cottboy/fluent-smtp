@@ -208,11 +208,105 @@ class SettingsController extends Controller
     {
         $this->verify();
 
-        $misc = $request->get('settings');
+        $input = $request->get('settings');
+
+        if (!is_array($input)) {
+            return $this->sendError([
+                'message' => __('Invalid settings.', 'fluent-smtp')
+            ], 422);
+        }
+
+        $stored = $settings->get();
+        $storedMisc = isset($stored['misc']) && is_array($stored['misc']) ? $stored['misc'] : [];
+
+        $misc = $this->sanitizeMiscSettings($input, $storedMisc);
+
+        if (!empty($misc['async_email_sending']) && $misc['async_email_sending'] === 'yes') {
+            \FluentMail\App\Services\Mailer\EmailQueue::ensureSchema();
+        }
+
         $settings->updateMiscSettings($misc);
+
+        \FluentMail\App\Services\Mailer\EmailQueue::syncSchedule();
+
         $this->sendSuccess([
             'message' => __('General settings saved.', 'fluent-smtp')
         ]);
+    }
+
+    /**
+     * Validate the queue settings a save is allowed to change.
+     *
+     * Missing keys are not filled in from the defaults: a save that only came
+     * from an older screen should not silently grow the stored misc object.
+     * The dependency rules still apply to whatever the request did send.
+     *
+     * @param array $input
+     * @param array $stored
+     * @return array
+     */
+    protected function sanitizeMiscSettings(array $input, array $stored)
+    {
+        $misc = array_merge($stored, $input);
+
+        $toggles = [
+            'log_emails',
+            'disable_fluentcrm_logs',
+            'simulate_emails',
+            'send_as_text',
+            'async_email_sending',
+            'email_rate_limit',
+            'retry_failed_emails',
+            'keep_email_attachments'
+        ];
+
+        foreach ($toggles as $key) {
+            if (array_key_exists($key, $misc)) {
+                $misc[$key] = $misc[$key] === 'yes' ? 'yes' : 'no';
+            }
+        }
+
+        $limits = [
+            'rate_limit_per_minute',
+            'rate_limit_per_hour',
+            'rate_limit_per_day',
+            'rate_limit_per_week',
+            'rate_limit_per_month'
+        ];
+
+        foreach ($limits as $key) {
+            if (array_key_exists($key, $misc)) {
+                $value = is_numeric($misc[$key]) ? (int)$misc[$key] : 0;
+                $value = max(0, min(1000000, $value));
+                $misc[$key] = (string)$value;
+            }
+        }
+
+        if (array_key_exists('log_saved_interval_days', $misc)) {
+            $allowedDays = [7, 14, 30, 60, 90, 180, 365, 730];
+            $days = absint($misc['log_saved_interval_days']);
+            $misc['log_saved_interval_days'] = (string)(in_array($days, $allowedDays, true) ? $days : 14);
+        }
+
+        $logEnabled = (!isset($misc['log_emails']) || $misc['log_emails'] === 'yes');
+        $asyncEnabled = isset($misc['async_email_sending']) && $misc['async_email_sending'] === 'yes';
+
+        if (!$logEnabled) {
+            if (array_key_exists('async_email_sending', $misc)) {
+                $misc['async_email_sending'] = 'no';
+            }
+            $asyncEnabled = false;
+        }
+
+        if (!$asyncEnabled) {
+            foreach (['email_rate_limit', 'retry_failed_emails'] as $key) {
+                if (array_key_exists($key, $misc)) {
+                    $misc[$key] = 'no';
+                }
+            }
+        }
+
+        return $misc;
     }
 
     public function delete(Request $request, Settings $settings)
